@@ -63,6 +63,15 @@ class MainActivity : AppCompatActivity() {
         setSupportActionBar(toolbar)
         onBackPressedDispatcher.addCallback(this, backInEdit)
 
+        val previous = Thread.getDefaultUncaughtExceptionHandler()
+        Thread.setDefaultUncaughtExceptionHandler { t, e ->
+            try {
+                java.io.File(filesDir, CRASH_FILE).writeText(android.util.Log.getStackTraceString(e))
+            } catch (_: Throwable) {
+            }
+            previous?.uncaughtException(t, e)
+        }
+
         lib = Library(this)
         adapter = ChannelAdapter(
             onClick = { c -> if (editMode) channelMenu(c) else play(c) },
@@ -107,11 +116,48 @@ class MainActivity : AppCompatActivity() {
         })
 
         refreshAll()
-        if (lib.hasPlaylist()) {
-            if (lib.playlistUrl.isNotEmpty()) reload(quiet = true)
-        } else {
-            playlistDialog()
+        if (!showLastCrash()) startup()
+    }
+
+    /** Loads the saved playlist in the background, then refreshes it from the internet. */
+    private fun startup() {
+        status.text = "Opening your channels…"
+        status.visibility = View.VISIBLE
+        io.execute {
+            val cached = try {
+                lib.readCache()
+            } catch (t: Throwable) {
+                null
+            }
+            main.post {
+                if (cached != null) lib.applySource(cached)
+                refreshAll()
+                if (lib.hasPlaylist()) {
+                    if (lib.playlistUrl.isNotEmpty()) reload(quiet = true)
+                } else {
+                    playlistDialog()
+                }
+            }
         }
+    }
+
+    /** If the app crashed last time, shows what happened so it can be fixed. */
+    private fun showLastCrash(): Boolean {
+        val f = java.io.File(filesDir, CRASH_FILE)
+        if (!f.exists()) return false
+        val text = try { f.readText().take(1500) } catch (_: Exception) { "" }
+        f.delete()
+        MaterialAlertDialogBuilder(this)
+            .setTitle("The app closed unexpectedly last time")
+            .setMessage("Please send a screenshot of this to get it fixed:\n\n$text")
+            .setPositiveButton("OK") { _, _ -> startup() }
+            .setCancelable(false)
+            .show()
+        return true
+    }
+
+    companion object {
+        const val CRASH_FILE = "last_crash.txt"
     }
 
     // ---------- menu ----------
@@ -378,39 +424,33 @@ class MainActivity : AppCompatActivity() {
         }
         io.execute {
             try {
-                val text = Library.fetch(url, lib.userAgent)
+                val list = lib.download(Library.open(url, lib.userAgent))
                 main.post {
-                    try {
-                        lib.setSource(text)
-                        refreshAll()
-                        if (!quiet) toast("${lib.channels().size} channels loaded")
-                    } catch (e: Exception) {
-                        if (!quiet) showError(e)
-                    }
+                    lib.applySource(list)
+                    refreshAll()
+                    if (!quiet) toast("${list.size} channels loaded")
                 }
-            } catch (e: Exception) {
-                main.post { if (!quiet) showError(e) else refreshList() }
+            } catch (t: Throwable) {
+                main.post { if (!quiet) showError(t) else refreshList() }
             }
         }
     }
 
     private fun importFrom(uri: Uri) {
+        status.text = "Loading playlist…"
+        status.visibility = View.VISIBLE
         io.execute {
             try {
-                val text = contentResolver.openInputStream(uri)!!.bufferedReader().use { it.readText() }
+                val list = lib.download(contentResolver.openInputStream(uri) ?: throw Exception("cannot open the file"))
                 main.post {
-                    try {
-                        lib.setSource(text)
-                        lib.playlistUrl = ""
-                        lib.save()
-                        refreshAll()
-                        toast("${lib.channels().size} channels loaded")
-                    } catch (e: Exception) {
-                        showError(e)
-                    }
+                    lib.applySource(list)
+                    lib.playlistUrl = ""
+                    lib.save()
+                    refreshAll()
+                    toast("${list.size} channels loaded")
                 }
-            } catch (e: Exception) {
-                main.post { showError(e) }
+            } catch (t: Throwable) {
+                main.post { showError(t) }
             }
         }
     }
@@ -428,9 +468,19 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun showError(e: Exception) {
+    private fun showError(t: Throwable) {
+        if (isFinishing || isDestroyed) return
         refreshList()
-        toast("Could not load playlist: ${e.message}")
+        val msg = if (t is OutOfMemoryError) {
+            "This playlist is too big for the phone's memory. Ask your provider for a smaller list (for example live TV only, without movies and series)."
+        } else {
+            "Could not load the playlist: ${t.message ?: t.javaClass.simpleName}"
+        }
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Playlist problem")
+            .setMessage(msg)
+            .setPositiveButton("OK", null)
+            .show()
     }
 
     // ---------- helpers ----------
