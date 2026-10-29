@@ -3,7 +3,9 @@ package com.myiptv.app
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
@@ -42,49 +44,59 @@ data class Channel(
 )
 
 object M3u {
+    /** Reads attr="value" without regex (fast on huge playlists). */
     private fun attr(line: String, name: String): String {
-        val m = Regex("$name=\"([^\"]*)\"", RegexOption.IGNORE_CASE).find(line)
-        return m?.groupValues?.get(1)?.trim() ?: ""
+        val k = "$name=\""
+        val i = line.indexOf(k, ignoreCase = true)
+        if (i < 0) return ""
+        val start = i + k.length
+        val end = line.indexOf('"', start)
+        return if (end < 0) "" else line.substring(start, end).trim()
     }
 
-    fun parse(text: String): List<SourceChannel> {
+    fun parse(text: String): List<SourceChannel> = parse(text.reader().buffered())
+
+    /** Streams the playlist line by line so even very large lists fit in memory. */
+    fun parse(reader: BufferedReader): List<SourceChannel> {
         val out = ArrayList<SourceChannel>()
         val seen = HashMap<String, Int>()
         var name = ""
         var logo = ""
         var group = ""
         var ua = ""
-        for (raw in text.lineSequence()) {
-            val line = raw.trim()
-            if (line.isEmpty()) continue
-            when {
-                line.startsWith("#EXTINF", ignoreCase = true) -> {
-                    // Commas can appear inside attributes, so read the name after the last quote
-                    val afterAttrs = line.substring(line.lastIndexOf('"') + 1)
-                    val i = afterAttrs.indexOf(',')
-                    name = if (i >= 0) afterAttrs.substring(i + 1).trim() else line.substringAfterLast(',', "").trim()
-                    if (name.isEmpty()) name = attr(line, "tvg-name")
-                    logo = attr(line, "tvg-logo")
-                    group = attr(line, "group-title")
-                }
-                line.startsWith("#EXTGRP:", ignoreCase = true) -> group = line.substring(8).trim()
-                line.startsWith("#EXTVLCOPT:http-user-agent=", ignoreCase = true) -> ua = line.substringAfter('=').trim()
-                line.startsWith("#") -> Unit
-                else -> {
-                    val n = seen[line] ?: 0
-                    seen[line] = n + 1
-                    val key = if (n == 0) line else "$line#$n"
-                    out.add(
-                        SourceChannel(
-                            key,
-                            name.ifEmpty { "Channel ${out.size + 1}" },
-                            line,
-                            logo,
-                            group.ifEmpty { "Other" },
-                            ua
+        reader.useLines { lines ->
+            for (raw in lines) {
+                val line = raw.trim()
+                if (line.isEmpty()) continue
+                when {
+                    line.startsWith("#EXTINF", ignoreCase = true) -> {
+                        // Commas can appear inside attributes, so read the name after the last quote
+                        val afterAttrs = line.substring(line.lastIndexOf('"') + 1)
+                        val i = afterAttrs.indexOf(',')
+                        name = if (i >= 0) afterAttrs.substring(i + 1).trim() else line.substringAfterLast(',', "").trim()
+                        if (name.isEmpty()) name = attr(line, "tvg-name")
+                        logo = attr(line, "tvg-logo")
+                        group = attr(line, "group-title")
+                    }
+                    line.startsWith("#EXTGRP:", ignoreCase = true) -> group = line.substring(8).trim()
+                    line.startsWith("#EXTVLCOPT:http-user-agent=", ignoreCase = true) -> ua = line.substringAfter('=').trim()
+                    line.startsWith("#") -> Unit
+                    else -> {
+                        val n = seen[line] ?: 0
+                        seen[line] = n + 1
+                        val key = if (n == 0) line else "$line#$n"
+                        out.add(
+                            SourceChannel(
+                                key,
+                                name.ifEmpty { "Channel ${out.size + 1}" },
+                                line,
+                                logo,
+                                group.ifEmpty { "Other" },
+                                ua
+                            )
                         )
-                    )
-                    name = ""; logo = ""; group = ""
+                        name = ""; logo = ""; group = ""
+                    }
                 }
             }
         }
@@ -99,8 +111,8 @@ class Library(ctx: Context) {
         const val OTHER = "Other"
         const val DEFAULT_UA = "Mozilla/5.0 (Linux; Android 13) MyIPTV/1.0"
 
-        /** Downloads a playlist, following redirects (also http <-> https). Call off the main thread. */
-        fun fetch(url: String, ua: String): String {
+        /** Opens a playlist download, following redirects (also http <-> https). Call off the main thread. */
+        fun open(url: String, ua: String): InputStream {
             var current = url
             repeat(6) {
                 val c = URL(current).openConnection() as HttpURLConnection
@@ -116,7 +128,7 @@ class Library(ctx: Context) {
                     return@repeat
                 }
                 if (code !in 200..299) throw Exception("server answered $code")
-                return c.inputStream.bufferedReader().use { it.readText() }
+                return c.inputStream
             }
             throw Exception("too many redirects")
         }
@@ -124,6 +136,7 @@ class Library(ctx: Context) {
 
     private val prefs = ctx.getSharedPreferences("library", Context.MODE_PRIVATE)
     private val cacheFile = File(ctx.filesDir, "playlist_cache.m3u")
+    private val tmpFile = File(ctx.filesDir, "playlist_download.tmp")
 
     var playlistUrl = ""
     var userAgent = ""
@@ -137,23 +150,43 @@ class Library(ctx: Context) {
     private val catRename = HashMap<String, String>()
     private val customCats = LinkedHashSet<String>()
 
+    // Results are cached; any edit or new playlist clears the cache.
+    private var cachedChannels: List<Channel>? = null
+    private var cachedCategories: List<String>? = null
+
     init {
         load()
-        try {
-            if (cacheFile.exists()) source = M3u.parse(cacheFile.readText())
-        } catch (_: Exception) {
+    }
+
+    private fun invalidate() {
+        cachedChannels = null
+        cachedCategories = null
+    }
+
+    /** Reads the saved copy of the playlist. Call off the main thread. */
+    fun readCache(): List<SourceChannel>? =
+        if (cacheFile.exists()) cacheFile.bufferedReader().let { M3u.parse(it) } else null
+
+    /** Saves a download (or opened file) to disk, then parses it. Call off the main thread. */
+    fun download(input: InputStream): List<SourceChannel> {
+        input.use { inp -> tmpFile.outputStream().use { out -> inp.copyTo(out, 64 * 1024) } }
+        val parsed = M3u.parse(tmpFile.bufferedReader())
+        if (parsed.isEmpty()) {
+            tmpFile.delete()
+            throw Exception("no channels found – is this an M3U playlist?")
         }
+        cacheFile.delete()
+        tmpFile.renameTo(cacheFile)
+        return parsed
+    }
+
+    /** Swaps in a parsed playlist. Call on the main thread. */
+    fun applySource(list: List<SourceChannel>) {
+        source = list
+        invalidate()
     }
 
     fun hasPlaylist() = source.isNotEmpty() || custom.isNotEmpty()
-
-    /** Replaces the provider playlist. The user's edits stay because they are keyed by stream link. */
-    fun setSource(text: String) {
-        val parsed = M3u.parse(text)
-        if (parsed.isEmpty()) throw Exception("no channels found – is this an M3U playlist?")
-        source = parsed
-        cacheFile.writeText(text)
-    }
 
     private fun resolve(g: String): String {
         var r = g
@@ -169,6 +202,7 @@ class Library(ctx: Context) {
     private fun edit(key: String) = edits.getOrPut(key) { ChannelEdit() }
 
     fun channels(): List<Channel> {
+        cachedChannels?.let { return it }
         val customKeys = custom.map { it.key }.toHashSet()
         val pos = HashMap<String, Int>()
         channelOrder.forEachIndexed { i, k -> pos[k] = i }
@@ -189,12 +223,19 @@ class Library(ctx: Context) {
                 )
             )
         }
-        return built
+        val result = built
             .sortedWith(compareBy<Pair<Int, Channel>>({ pos[it.second.key] ?: Int.MAX_VALUE }, { it.first }))
             .map { it.second }
+        cachedChannels = result
+        return result
     }
 
     fun categories(includeHidden: Boolean): List<String> {
+        val ordered = cachedCategories ?: buildCategories().also { cachedCategories = it }
+        return if (includeHidden) ordered else ordered.filter { it !in hiddenCats }
+    }
+
+    private fun buildCategories(): List<String> {
         val seen = LinkedHashSet<String>()
         for (c in channels()) seen.add(c.group)
         seen.addAll(customCats)
@@ -203,7 +244,7 @@ class Library(ctx: Context) {
         val ordered = seen.withIndex()
             .sortedWith(compareBy<IndexedValue<String>>({ pos[it.value] ?: Int.MAX_VALUE }, { it.index }))
             .map { it.value }
-        return if (includeHidden) ordered else ordered.filter { it !in hiddenCats }
+        return ordered
     }
 
     fun isCategoryHidden(name: String) = name in hiddenCats
@@ -314,6 +355,7 @@ class Library(ctx: Context) {
 
     // ---------- storage ----------
     fun save() {
+        invalidate()
         val o = JSONObject()
         o.put("url", playlistUrl)
         o.put("ua", userAgent)
