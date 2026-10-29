@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.MyIPTV" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">#3D8BFF</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSecondaryContainer">#1F3A66</item>
+        <item name="colorOnSecondaryContainer">#FFFFFF</item>
+        <item name="android:windowBackground">#0A0D14</item>
+        <item name="android:statusBarColor">#0A0D14</item>
+        <item name="android:navigationBarColor">#0A0D14</item>
+    </style>
+
+    <style name="Theme.MyIPTV.Player">
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:windowFullscreen">true</item>
+    </style>
+</resources>
